@@ -2,24 +2,25 @@ import casadi as ca
 import numpy as np
 import matplotlib.pyplot as plt
 
-# 参数定义
+# === 参数定义 ===
 N = 10          # 控制/预测步长
-T = 0.2         # 每步采样时间
-L = 2.0         # 车辆长度
+T = 0.2         # 采样周期
+L = 2.0         # 车辆轴距
+k_steps = 100   # 模拟迭代次数
 
-# 状态与控制输入
+# === 状态和控制输入符号变量 ===
 x = ca.SX.sym('x')
 y = ca.SX.sym('y')
 theta = ca.SX.sym('theta')
 states = ca.vertcat(x, y, theta)
 n_states = states.size()[0]
 
-v = ca.SX.sym('v')       # 速度
-delta = ca.SX.sym('delta')  # 转向角
+v = ca.SX.sym('v')
+delta = ca.SX.sym('delta')
 controls = ca.vertcat(v, delta)
 n_controls = controls.size()[0]
 
-# 非线性动力学模型
+# === 非线性模型 ===
 rhs = ca.vertcat(
     v * ca.cos(theta),
     v * ca.sin(theta),
@@ -27,114 +28,78 @@ rhs = ca.vertcat(
 )
 f = ca.Function('f', [states, controls], [rhs])
 
-# 迭代次数
-k_steps = 100
-n = 3
-p = 2
-# 开辟所有状态x的存储空间并初始状态
-X_k = np.zeros((n, k_steps+1))
-
-# 开辟所有控制输入u的存储空间
-U_k = np.zeros((p, k_steps))
-
-# 状态预测函数（Euler法 离散化）
-# def state_model(x0, u_seq):
-#     x_traj = [x0]
-#     x_current = x0
-#     for i in range(N):
-#         u_current = u_seq[:, i]
-#         x_current = x_current + T * f(x_current, u_current)
-#         x_traj.append(x_current)
-#     return ca.hcat(x_traj)
+# === 状态预测函数 ===
 def system_model(x_current, u_current):
-    x_current = x_current + T * f(x_current, u_current)
-    return x_current
+    return x_current + T * f(x_current, u_current)
 
 def state_model(x0, u_seq):
     x_traj = [x0]
     x_current = x0
     for i in range(N):
         u_current = u_seq[:, i]
-        # x_current = x_current + T * f(x_current, u_current)
         x_current = system_model(x_current, u_current)
         x_traj.append(x_current)
-
     return ca.hcat(x_traj)
-def nmpc_predict(x_c, U, Q, R):
-    # 优化变量
-    # U = ca.SX.sym('U', n_controls, N)
-    X_traj = state_model(x_c, U)
-    # X_k[:, 0] = X_traj
-    # 成本函数
-    # Q = np.diag([10, 10, 1])  # 状态误差权重
-    # R = np.diag([1, 10])  # 控制输入权重
+
+# === NMPC 优化器构建函数 ===
+def nmpc_optimize(x_init, ref, Q, R):
+    U = ca.SX.sym('U', n_controls, N)  # 符号优化变量
+    X_pred = state_model(x_init, U)
+
     obj = 0
     for k in range(N):
-        dx = X_traj[:, k] - ref[:, k]
+        dx = X_pred[:, k] - ref[:, k]
         obj += ca.mtimes([dx.T, Q, dx]) + ca.mtimes([U[:, k].T, R, U[:, k]])
 
-    # 约束（例如控制限）
+    # 控制输入约束
+    g = []
     lbg = []
     ubg = []
-    g = []
     for k in range(N):
-        g.append(U[0, k])  # v
-        g.append(U[1, k])  # delta
-        lbg += [0.0, -0.5]  # v in [0, 1.5], delta in [-0.5, 0.5] rad
+        g += [U[0, k], U[1, k]]
+        lbg += [0.0, -0.5]    # v ∈ [0, 1.5], delta ∈ [-0.5, 0.5]
         ubg += [1.5, 0.5]
 
-    # 构造 NLP 求解器
     opt_vars = ca.reshape(U, -1, 1)
     nlp_prob = {'f': obj, 'x': opt_vars, 'g': ca.vertcat(*g)}
     solver = ca.nlpsol('solver', 'ipopt', nlp_prob)
 
-    # 初始化控制输入猜测
-    u0_guess = np.zeros((n_controls, N))
-    u0_flat = u0_guess.reshape((-1, 1))
+    # 初始猜测
+    u0_guess = np.zeros((n_controls * N, 1))
+    sol = solver(x0=u0_guess, lbg=lbg, ubg=ubg)
 
-    # 求解
-    sol = solver(x0=u0_flat, lbg=lbg, ubg=ubg)
     u_opt = ca.reshape(sol['x'], n_controls, N)
-    return u_opt
+    return u_opt.full()  # 转为NumPy数组返回
 
+# === 主程序 ===
 if __name__ == "__main__":
-    # 初始状态与目标轨迹
-    x0 = ca.DM([0, 2, 0])  # 初始位置
-    ref = np.array([[i*0.5, 0, 0] for i in range(k_steps+1)]).T  # 目标：向x轴方向直行
+    X_k = np.zeros((n_states, k_steps + 1))
+    U_k = np.zeros((n_controls, k_steps))
+    X_k[:, 0] = np.array([0, 2, 0])  # 初始状态
 
-    # 优化变量
-    U = ca.SX.sym('U', n_controls, N)
-    # 成本函数
-    Q = np.diag([10, 10, 1])     # 状态误差权重
-    R = np.diag([1, 10])         # 控制输入权重
+    Q = np.diag([10, 10, 1])
+    R = np.diag([1, 10])
+
     for i in range(k_steps):
-        X_k[:, i] = X_traj
-        u_opt = nmpc_predict()
+        # 目标轨迹向 x 轴方向移动
+        ref = np.array([[X_k[0, i] + j * 0.5, 0, 0] for j in range(N + 1)]).T
 
+        x_k = ca.DM(X_k[:, i])  # 当前状态作为 casadi DM 类型传入
+        u_traj = nmpc_optimize(x_k, ref, Q, R)  # 返回控制序列（NumPy数组）
 
+        u_k = u_traj[:, 0]  # 取第一步控制应用
+        x_next = system_model(x_k, ca.DM(u_k))
 
+        X_k[:, i + 1] = np.array(x_next.full()).flatten()
+        U_k[:, i] = u_k
 
-    # 输出结果
-    print("Optimal control sequence:")
-    print(u_opt)
-
-
-
-
-    # ---------------------------
-    # 可视化：预测轨迹 vs 参考轨迹
-    # ---------------------------
-    # X_pred = predict_state(x0, u_opt)
-    # X_pred_val = ca.Function('X_val', [], [X_pred])()['o0'].full()
-    #
-    # plt.figure(figsize=(8, 6))
-    # plt.plot(ref[0, :], ref[1, :], 'r--', label='Reference Path')              # 目标轨迹
-    # plt.plot(X_pred_val[0, :], X_pred_val[1, :], 'b.-', label='Predicted Path')  # 预测轨迹
-    #
-    # plt.xlabel('X position')
-    # plt.ylabel('Y position')
-    # plt.title('NMPC Predicted Trajectory')
-    # plt.legend()
-    # plt.grid(True)
-    # plt.axis("equal")
-    # plt.show()
+    # === 可视化 ===
+    plt.figure(figsize=(8, 6))
+    plt.plot(X_k[0, :], X_k[1, :], label="NMPC Trajectory")
+    plt.xlabel("X")
+    plt.ylabel("Y")
+    plt.title("Nonlinear MPC Path Tracking")
+    plt.grid(True)
+    plt.axis("equal")
+    plt.legend()
+    plt.show()
